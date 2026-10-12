@@ -267,7 +267,7 @@ const mountFavoriteLayer = (folium, container, ctx) => {
     .lss-favorite[data-visible=true]:hover .lss-favorite__tooltip{opacity:1;transform:translateY(0)}
   `;
   const button = document.createElement('button'); button.type = 'button'; button.className = 'lss-favorite';
-  button.setAttribute('aria-label', label(resolveLocale(ctx), '喜欢推荐', 'Keep this animation for this song'));
+  button.setAttribute('aria-label', label(resolveLocale(ctx), '为这首歌固定当前动画', 'Keep this animation for this song'));
   const icon = document.createElement('span'); icon.className = 'lss-favorite__icon';
   const tooltip = document.createElement('span'); tooltip.className = 'lss-favorite__tooltip';
   button.append(icon, tooltip); container.append(style, button);
