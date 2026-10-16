@@ -8,6 +8,7 @@
 - 随机池读取 Folia 的实时歌词动画注册表，包含官方动画和已经加载的第三方模组动画；
 - “每首歌都随机样式”：每次换歌重新抽取；已经用爱心固定的歌曲优先使用本地记忆；
 - “固定随机”：第一次为歌曲抽取后写入本地记忆，之后这首歌继续使用同一个动画；
+- 播放页右下角爱心上方提供“刷新当前随机动画”按钮：立即为当前播放重新抽取；在“固定随机”模式下会同步更新这首歌的记忆，在“每首歌都随机样式”模式下只刷新当前播放；
 - 播放页右下角提供爱心按钮，点击固定当前动画，再次点击取消固定；
 - 本地记忆保存在该模组的 `song-style-map` 数据项中，最多保留最近 2000 首歌曲；歌曲键包含来源、歌曲名、歌手和专辑；
 - 不联网，不上传歌曲信息，不需要 API Key。
@@ -29,11 +30,11 @@ Folia 自带的“每首歌随机模式”和本模组的随机动画会同时�
 
 ## 渲染限制
 
-模组会把宿主设置中可读取到的 `visualizerTunings`、当前模式 tuning 和 `background` 传给实际动画渲染器；因此 Folia 暴露这些字段时，抽到的内置动画会沿用用户参数和背景。0.7.18 的公开内部导出没有暴露视觉器资源 store，所以自定义 Monet 背景图片不能从模组内部完整恢复；背景模式、通用背景开关和各背景 tuning 会传递。
+模组会从 `stores.visualizerSettings` 读取各模式的 tuning，并按宿主渲染器实际使用的字段名（例如 `classicTuning`、`cadenzaTuning`）传给被抽中的渲染器；同时传递背景模式、通用背景开关和各背景 tuning。Folia 0.7.18 的公开内部导出没有暴露视觉器资源 store，所以自定义 Monet 背景图片不能从模组内部完整恢复。
 
-动画的 `currentTime` 优先使用宿主上下文提供的 MotionValue。`audioPower` 和 `audioBands` 也会优先使用宿主提供的 MotionValue；如果当前版本没有暴露这些信号，模组只能用带 `.get()`/`.on('change')` 兼容接口的本地适配器，根据音频快照更新。渲染器挂在模组自己创建的 React 根节点，因此依赖宿主 React Context 的第三方动画可能无法完整工作。
+Folia 的模组上下文只提供 `currentTime` 时钟和 `audio.getPower()`/`audio.getBands()` getter；音频 getter 的值是 0–1 快照，不提供真正的 MotionValue。模组保留这个数值范围，并用本地 `.get()`/`.on('change')` 适配器转换成渲染器可读的信号；`currentTime` 也只是具有 `.get()`/`.on()` 的 FoliumClock，不是 MotionValue。依赖这些对象接口的动画通常可以渲染，但像使用 `useSpring(audioBands.bass)` 的动画可能无法随音乐连续响应，这需要在实际播放器中验证。渲染器挂在模组自己创建的 React 根节点，因此依赖宿主 React Context 的第三方动画可能无法完整工作。
 
-当前工作区没有可启动的 Folia 0.7.18 播放器，无法在这里声称已经逐一运行 14 个内置动画和第三方动画；发布前应在 Folia 0.7.18 中逐个切换确认。已完成 JavaScript 语法检查，并对注册表为空、缺少内部接口、预览模式和存储失败路径做了保护。
+Folia 0.7.18 源码确认包含 14 个内置动画（cadenza、cappella、claddagh、classic、diorama、fume、lumiere、monet、partita、pendolo、sonnet、still、tempera、tilt）。当前工作区没有可启动的 Folia 0.7.18 播放器和第三方模组，无法声称已经逐一实机运行这些动画；发布前应在 Folia 0.7.18 中逐个切换，并至少加载一个第三方视觉器确认。已完成 JavaScript 语法检查，并对注册表为空、缺少内部接口、预览模式和存储失败路径做了保护。
 
 ## 本地安装
 

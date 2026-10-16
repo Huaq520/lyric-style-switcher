@@ -14,6 +14,9 @@ const SETTINGS_KEY = 'randomMode';
 const MAX_MEMORY_ENTRIES = 2000;
 
 const state = { active: false, mode: null, songKey: null, saved: false, listeners: new Set() };
+// Keep this outside the mount state. Folia remounts a visualizer when a song
+// changes, so clearing it during unmount would make the next pick repeat.
+let lastRandomMode = null;
 const notifyState = () => state.listeners.forEach((listener) => listener());
 const listenState = (listener) => {
   state.listeners.add(listener);
@@ -30,9 +33,20 @@ const label = (locale, zh, en) => String(locale || '').toLowerCase().startsWith(
 const getSongKey = (song) => {
   if (!song) return null;
   const source = song.source || 'unknown';
+  const id = song.id || song.ref || song.title || 'unknown';
+  // Keep the album in the key even when the provider supplies an id. Some
+  // providers reuse an id for alternate album/release metadata.
+  return `${source}:${id}|${song.title || ''}|${song.artist || ''}|${song.album || ''}`;
+};
+
+const getLegacySongKey = (song) => {
+  if (!song) return null;
+  const source = song.source || 'unknown';
   const id = song.id || song.ref || `${song.title}|${song.artist || ''}|${song.album || ''}`;
   return `${source}:${id}`;
 };
+
+const getSongKeys = (song) => [...new Set([getSongKey(song), getLegacySongKey(song)].filter(Boolean))];
 
 const trimMemory = (memory) => {
   const keys = Object.keys(memory);
@@ -104,8 +118,6 @@ const getThemeSettingsState = (folium) => {
 };
 
 const readVisualizerTuning = (folium, mode) => {
-  let store;
-  try { store = folium.internals?.stores?.visualizerSettings; } catch (_) { store = null; }
   const settings = getVisualizerSettingsState(folium);
   const themeSettings = getThemeSettingsState(folium);
   const tuningKeys = {
@@ -118,9 +130,7 @@ const readVisualizerTuning = (folium, mode) => {
   const visualizerTunings = Object.fromEntries(Object.entries(tuningKeys)
     .map(([name, key]) => [name, settings[key]])
     .filter(([, value]) => value !== undefined));
-  const byMode = visualizerTunings?.[mode]
-    ?? (store && typeof store.getVisualizerTuning === 'function' ? store.getVisualizerTuning(mode) : undefined);
-  const visualizerTuning = byMode;
+  const visualizerTuning = visualizerTunings?.[mode];
   const background = {
     mode: settings.visualizerBackgroundMode ?? null,
     common: {
@@ -136,17 +146,24 @@ const readVisualizerTuning = (folium, mode) => {
     sora: { tuning: settings.soraBackgroundTuning },
     url: { items: settings.urlBackgroundList, selectedId: settings.urlBackgroundSelectedId },
   };
-  return { visualizerTunings, visualizerTuning, background };
+  const tuningProps = Object.fromEntries(Object.entries(tuningKeys)
+    .map(([modeName, key]) => [key, settings[key]])
+    .filter(([, value]) => value !== undefined));
+  return { visualizerTunings, visualizerTuning, tuningProps, background };
 };
 
 // A small MotionValue-compatible adapter. Folium exposes analyser values as
 // snapshots; builtin renderers expect `.get()` and `.on('change')` signals.
 const createSignal = (initial) => {
   let value = initial;
+  let previous = initial;
   const listeners = new Set();
   return {
     get: () => value,
-    getPrevious: () => value,
+    getPrevious: () => previous,
+    getVelocity: () => 0,
+    isAnimating: () => false,
+    stop: () => {},
     on: (event, listener) => {
       if (event !== 'change') return () => {};
       listeners.add(listener);
@@ -154,6 +171,7 @@ const createSignal = (initial) => {
     },
     set: (next) => {
       if (Object.is(next, value)) return;
+      previous = value;
       value = next;
       listeners.forEach((listener) => listener(value));
     },
@@ -161,12 +179,6 @@ const createSignal = (initial) => {
 };
 
 const createAudioSignals = (ctx) => {
-  const isMotionValue = (value) => value && typeof value.get === 'function' && typeof value.on === 'function';
-  const hostPower = ctx.audioPower || ctx.audio?.power || ctx.audio?.audioPower;
-  const hostBands = ctx.audioBands || ctx.audio?.bands || ctx.audio?.audioBands;
-  if (isMotionValue(hostPower) && hostBands && Object.values(hostBands).some(isMotionValue)) {
-    return { power: hostPower, bands: hostBands, update: () => {} };
-  }
   const power = createSignal(0);
   const bands = {
     bass: createSignal(0), lowMid: createSignal(0), mid: createSignal(0),
@@ -174,7 +186,10 @@ const createAudioSignals = (ctx) => {
   };
   const scale = (value) => {
     const number = Number(value) || 0;
-    return number >= 0 && number <= 1 ? number * 255 : number;
+    // FoliumAudio exposes normalized analyser values (0..1). Builtin
+    // renderers normalize defensively themselves, so preserve that contract
+    // instead of converting to the legacy 0..255 scale.
+    return Math.max(0, Math.min(1, number));
   };
   const update = () => {
     const audio = ctx.audio;
@@ -195,6 +210,9 @@ const buildRendererProps = (folium, ctx, audio, entry) => {
   const lineIndex = display.staticMode && display.staticLineIndex !== null
     ? display.staticLineIndex : ctx.getLineIndex();
   return {
+    // FoliumClock intentionally has the same get/on surface needed by the
+    // visualizer runtime. It is not a framer-motion MotionValue, but keeping
+    // the adapter boundary explicit prevents accidental numeric snapshots.
     currentTime: ctx.currentTime,
     currentLineIndex: lineIndex,
     lines: ctx.lines,
@@ -206,6 +224,7 @@ const buildRendererProps = (folium, ctx, audio, entry) => {
     visualizerTunings: tuning.visualizerTunings,
     visualizerTuning: tuning.visualizerTuning,
     tuning: tuning.visualizerTuning,
+    ...tuning.tuningProps,
     background: tuning.background,
     showText: display.showText,
     songTitle: song?.title || null,
@@ -235,17 +254,21 @@ const buildRendererProps = (folium, ctx, audio, entry) => {
 const rememberCurrent = async (folium, ctx, songKey, mode) => {
   if (!songKey || !mode || ctx?.isPreview || folium.env?.context !== 'main') return false;
   const memory = await safeStorageGet(folium.storage);
+  // Migrate/remove the pre-1.2 key when this song is saved again, while still
+  // reading it below so existing users do not lose their fixed animations.
+  getSongKeys(ctx.song).filter((key) => key !== songKey).forEach((key) => delete memory[key]);
   rememberInMemory(memory, songKey, mode);
   const ok = await safeStorageSet(folium.storage, memory);
   if (ok) { state.mode = mode; state.saved = true; notifyState(); }
   return ok;
 };
 
-const forgetCurrent = async (folium, songKey) => {
+const forgetCurrent = async (folium, song, songKey = getSongKey(song)) => {
   if (!songKey || folium.env?.context !== 'main') return false;
   const memory = await safeStorageGet(folium.storage);
-  if (!Object.prototype.hasOwnProperty.call(memory, songKey)) return true;
-  delete memory[songKey];
+  const keys = getSongKeys(song);
+  if (!keys.some((key) => Object.prototype.hasOwnProperty.call(memory, key))) return true;
+  keys.forEach((key) => delete memory[key]);
   const ok = await safeStorageSet(folium.storage, memory);
   if (ok) { state.saved = false; notifyState(); }
   return ok;
@@ -257,9 +280,11 @@ const chooseMode = async (folium, ctx, setting) => {
   if (!entries.length) return null;
   if (songKey) {
     const memory = await safeStorageGet(folium.storage);
-    const saved = entries.find((entry) => entry.mode === memory[songKey]);
+    const saved = getSongKeys(ctx.song)
+      .map((key) => entries.find((entry) => entry.mode === memory[key]))
+      .find(Boolean);
     if (saved) return { entry: saved, saved: true };
-    const picked = pickEntry(folium, state.mode);
+    const picked = pickEntry(folium, lastRandomMode);
     if (picked && setting === 'fixed' && !ctx.isPreview && folium.env?.context === 'main') {
       rememberInMemory(memory, songKey, picked.mode);
       const persisted = await safeStorageSet(folium.storage, memory);
@@ -267,7 +292,7 @@ const chooseMode = async (folium, ctx, setting) => {
     }
     return picked ? { entry: picked, saved: false } : null;
   }
-  const picked = pickEntry(folium, state.mode);
+  const picked = pickEntry(folium, lastRandomMode);
   return picked ? { entry: picked, saved: false } : null;
 };
 
@@ -328,8 +353,11 @@ const mountDelegatingVisualizer = (folium, container, ctx) => {
   let selected = null; let disposed = false;
   const live = !ctx.isPreview;
   if (live) disableHostRandomModeIfNeeded(folium, ctx);
-  if (live) { state.active = true; state.mode = null; state.saved = false; state.songKey = getSongKey(ctx.song); notifyState(); }
-  const disposeFavorite = live ? mountFavoriteLayer(folium, container, ctx) : () => {};
+  if (live) {
+    // A song change remounts this visualizer. Clear only the UI snapshot;
+    // `lastRandomMode` remains module-scoped so the next pick is not a repeat.
+    state.active = true; state.mode = null; state.saved = false; state.songKey = getSongKey(ctx.song); notifyState();
+  }
   let currentSetting = ctx.getSettings?.()[SETTINGS_KEY] || 'each';
   const repaint = () => {
     if (disposed || !selected) return;
@@ -342,11 +370,28 @@ const mountDelegatingVisualizer = (folium, container, ctx) => {
     const choice = await chooseMode(folium, ctx, currentSetting);
     if (!choice || disposed) return;
     selected = choice.entry;
+    lastRandomMode = selected.mode;
     state.mode = selected.mode;
     state.saved = choice.saved;
     if (live) state.songKey = getSongKey(ctx.song);
     if (live) notifyState(); repaint();
   };
+  const refresh = async () => {
+    if (disposed || !selected) return false;
+    const picked = pickEntry(folium, selected.mode || lastRandomMode);
+    if (!picked) return false;
+    selected = picked;
+    lastRandomMode = picked.mode;
+    state.mode = picked.mode;
+    currentSetting = ctx.getSettings?.()[SETTINGS_KEY] || currentSetting;
+    state.saved = false;
+    if (currentSetting === 'fixed' && !ctx.isPreview && folium.env?.context === 'main') {
+      state.saved = await rememberCurrent(folium, ctx, getSongKey(ctx.song), picked.mode);
+    }
+    repaint();
+    return true;
+  };
+  const disposeFavorite = live ? mountFavoriteLayer(folium, container, ctx, refresh) : () => {};
   const offClock = ctx.currentTime.on('change', () => audio.update());
   const offCtx = ctx.subscribe(() => {
     audio.update();
@@ -358,30 +403,45 @@ const mountDelegatingVisualizer = (folium, container, ctx) => {
   return () => { disposed = true; offClock(); offCtx(); root.unmount(); disposeFavorite(); renderHost.remove(); if (live) { state.active = false; state.mode = null; state.songKey = null; state.saved = false; notifyState(); } };
 };
 
-const mountFavoriteLayer = (folium, container, ctx) => {
+const mountFavoriteLayer = (folium, container, ctx, refresh) => {
   const style = document.createElement('style'); style.textContent = `
-    .lss-favorite{position:absolute;right:clamp(16px,4vw,32px);bottom:80px;z-index:40;width:48px;height:48px;padding:0;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--lss-text);background:color-mix(in srgb,var(--lss-bg) 78%,transparent);border:1px solid var(--lss-border);border-radius:50%;backdrop-filter:blur(14px);box-shadow:0 8px 24px #0004;font:600 24px/1 system-ui,sans-serif;opacity:.78;transform:translateY(8px) scale(.92);pointer-events:none;transition:opacity .2s ease,transform .2s ease,border-color .2s ease,color .2s ease,background .2s ease}
-    .lss-favorite[data-visible=true]{opacity:.78;transform:translateY(0) scale(1);pointer-events:auto}
-    .lss-favorite[data-visible=true]:hover{opacity:1;transform:translateY(-2px) scale(1.06);border-color:var(--lss-accent)}
-    .lss-favorite[data-chrome-hidden=true]{opacity:0;transform:translateY(8px) scale(.92);pointer-events:none}
+    .lss-action{position:absolute;right:clamp(16px,4vw,32px);z-index:40;width:48px;height:48px;padding:0;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--lss-text);background:color-mix(in srgb,var(--lss-bg) 78%,transparent);border:1px solid var(--lss-border);border-radius:50%;backdrop-filter:blur(14px);box-shadow:0 8px 24px #0004;font:600 24px/1 system-ui,sans-serif;opacity:.78;transform:translateY(8px) scale(.92);pointer-events:none;transition:opacity .2s ease,transform .2s ease,border-color .2s ease,color .2s ease,background .2s ease}
+    .lss-favorite{bottom:80px}.lss-refresh{bottom:136px;font-size:25px}
+    .lss-action[data-visible=true]{opacity:.78;transform:translateY(0) scale(1);pointer-events:auto}
+    .lss-action[data-visible=true]:hover{opacity:1;transform:translateY(-2px) scale(1.06);border-color:var(--lss-accent)}
+    .lss-action[data-chrome-hidden=true]{opacity:0;transform:translateY(8px) scale(.92);pointer-events:none}
     .lss-favorite[data-saved=true]{color:var(--lss-accent);border-color:var(--lss-accent)}
-    .lss-favorite__icon{display:block;transform:translateY(-1px)}
-    .lss-favorite__tooltip{position:absolute;right:0;bottom:56px;min-width:max-content;padding:7px 10px;border:1px solid var(--lss-border);border-radius:9px;background:color-mix(in srgb,var(--lss-bg) 92%,transparent);color:var(--lss-text);font:500 12px/1.2 system-ui,sans-serif;box-shadow:0 6px 18px #0003;opacity:0;pointer-events:none;transform:translateY(4px);transition:opacity .16s ease,transform .16s ease}
-    .lss-favorite[data-visible=true]:hover .lss-favorite__tooltip{opacity:1;transform:translateY(0)}
+    .lss-action__icon{display:block;transform:translateY(-1px)}
+    .lss-action__tooltip{position:absolute;right:0;bottom:56px;min-width:max-content;padding:7px 10px;border:1px solid var(--lss-border);border-radius:9px;background:color-mix(in srgb,var(--lss-bg) 92%,transparent);color:var(--lss-text);font:500 12px/1.2 system-ui,sans-serif;box-shadow:0 6px 18px #0003;opacity:0;pointer-events:none;transform:translateY(4px);transition:opacity .16s ease,transform .16s ease}
+    .lss-action[data-visible=true]:hover .lss-action__tooltip{opacity:1;transform:translateY(0)}
   `;
-  const button = document.createElement('button'); button.type = 'button'; button.className = 'lss-favorite';
+  const refreshButton = document.createElement('button'); refreshButton.type = 'button'; refreshButton.className = 'lss-action lss-refresh';
+  const refreshIcon = document.createElement('span'); refreshIcon.className = 'lss-action__icon'; refreshIcon.textContent = '↻';
+  const refreshTooltip = document.createElement('span'); refreshTooltip.className = 'lss-action__tooltip';
+  refreshButton.append(refreshIcon, refreshTooltip);
+  const button = document.createElement('button'); button.type = 'button'; button.className = 'lss-action lss-favorite';
   button.setAttribute('aria-label', label(resolveLocale(ctx), '为这首歌固定当前动画', 'Keep this animation for this song'));
-  const icon = document.createElement('span'); icon.className = 'lss-favorite__icon';
-  const tooltip = document.createElement('span'); tooltip.className = 'lss-favorite__tooltip';
-  button.append(icon, tooltip); container.append(style, button);
+  const icon = document.createElement('span'); icon.className = 'lss-action__icon';
+  const tooltip = document.createElement('span'); tooltip.className = 'lss-action__tooltip';
+  button.append(icon, tooltip); container.append(style, refreshButton, button);
   const paint = () => {
     const theme = ctx.getTheme(); const active = state.active && state.songKey === getSongKey(ctx.song); const saved = Boolean(active && state.saved);
     const display = ctx.getDisplay?.() || {};
     container.style.setProperty('--lss-bg', theme.backgroundColor); container.style.setProperty('--lss-text', theme.primaryColor); container.style.setProperty('--lss-accent', theme.accentColor); container.style.setProperty('--lss-border', `${theme.secondaryColor}88`);
-    button.dataset.visible = String(active); button.dataset.chromeHidden = String(Boolean(display.isPlayerChromeHidden)); button.dataset.saved = String(saved);
+    const chromeHidden = Boolean(display.isPlayerChromeHidden);
+    button.dataset.visible = String(active); button.dataset.chromeHidden = String(chromeHidden); button.dataset.saved = String(saved);
+    refreshButton.dataset.visible = String(active); refreshButton.dataset.chromeHidden = String(chromeHidden);
     const locale = resolveLocale(ctx);
     button.setAttribute('aria-label', saved ? label(locale, '取消固定此动画', 'Unpin this animation') : label(locale, '为这首歌固定当前动画', 'Keep this animation for this song'));
     icon.textContent = saved ? '♥' : '♡'; tooltip.textContent = saved ? label(locale, '点击取消固定', 'Click to unpin') : label(locale, '为这首歌固定当前动画', 'Keep this animation for this song');
+    refreshButton.setAttribute('aria-label', label(locale, '刷新当前随机动画', 'Refresh random animation'));
+    refreshTooltip.textContent = label(locale, '刷新当前随机动画', 'Refresh random animation');
+  };
+  refreshButton.onclick = async (event) => {
+    event.stopPropagation();
+    const ok = await refresh();
+    if (ok) folium.ui.toast(label(resolveLocale(ctx), '已刷新当前歌词动画', 'Current lyric animation refreshed'), { type: 'success' });
+    paint();
   };
   button.onclick = async (event) => {
     event.stopPropagation();
@@ -390,7 +450,7 @@ const mountFavoriteLayer = (folium, container, ctx) => {
     const locale = resolveLocale(ctx);
     const wasSaved = state.saved;
     const ok = wasSaved
-      ? await forgetCurrent(folium, songKey)
+      ? await forgetCurrent(folium, ctx.song, songKey)
       : await rememberCurrent(folium, ctx, songKey, state.mode);
     if (ok) {
       folium.ui.toast(wasSaved ? label(locale, '已取消固定此动画', 'Animation unpinned') : label(locale, '已为这首歌固定当前动画', 'Animation saved for this song'), { type: 'success' });
@@ -401,7 +461,7 @@ const mountFavoriteLayer = (folium, container, ctx) => {
   const localeObserver = typeof MutationObserver !== 'undefined' && typeof document !== 'undefined'
     ? new MutationObserver(paint) : null;
   localeObserver?.observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] });
-  return () => { offState(); offTheme(); localeObserver?.disconnect(); style.remove(); button.remove(); };
+  return () => { offState(); offTheme(); localeObserver?.disconnect(); style.remove(); refreshButton.remove(); button.remove(); };
 };
 
 export default function activate(folium) {
